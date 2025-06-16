@@ -64,3 +64,5 @@ terraform apply
 - VPC CIDR: 10.0.0.0/16
 - Public Subnet CIDR: 10.0.1.0/24
 - Internet Gateway for public internet access
+<!-- BEGIN_TF_DOCS -->
+<!-- END_TF_DOCS -->

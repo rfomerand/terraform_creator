@@ -1,0 +1,203 @@
+name: Terraform CI
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform.yml'
+      - '.tflint.hcl'
+
+env:
+  TF_VERSION: "1.5.7"
+  AWS_DEFAULT_REGION: "us-east-1"
+  
+jobs:
+  terraform-check:
+    name: Terraform Lint and Plan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Format Check
+      id: fmt
+      run: |
+        echo "::group::Checking Terraform format"
+        terraform fmt -check -recursive -diff
+        echo "::endgroup::"
+      continue-on-error: true
+
+    - name: Terraform Init
+      id: init
+      run: |
+        echo "::group::Initializing Terraform"
+        terraform init -backend=false
+        echo "::endgroup::"
+
+    - name: Terraform Validate
+      id: validate
+      run: |
+        echo "::group::Validating Terraform configuration"
+        terraform validate -no-color
+        echo "::endgroup::"
+
+    - name: TFLint Setup
+      uses: terraform-linters/setup-tflint@v4
+      with:
+        tflint_version: latest
+
+    - name: Init TFLint
+      run: |
+        echo "::group::Initializing TFLint"
+        tflint --init
+        echo "::endgroup::"
+
+    - name: Run TFLint
+      id: tflint
+      run: |
+        echo "::group::Running TFLint"
+        tflint --format compact
+        echo "::endgroup::"
+      continue-on-error: true
+
+    - name: Security Scan with Checkov
+      id: checkov
+      uses: bridgecrewio/checkov-action@v12
+      with:
+        directory: .
+        framework: terraform
+        output_format: cli
+        soft_fail: true
+
+    - name: Generate Terraform Docs
+      uses: terraform-docs/gh-actions@v1
+      with:
+        working-dir: .
+        output-file: README.md
+        output-method: inject
+        git-push: false
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        echo "::group::Running Terraform plan"
+        # Create a dummy key file for plan (won't be used, just for validation)
+        mkdir -p ~/.ssh
+        touch ~/.ssh/dummy_key.pub
+        terraform plan -no-color -input=false \
+          -var="key_name=dummy_key" \
+          -out=tfplan
+        echo "::endgroup::"
+      continue-on-error: true
+
+    - name: Generate Plan JSON for PR Comment
+      id: show_plan
+      if: steps.plan.outcome == 'success'
+      run: |
+        terraform show -no-color tfplan > plan.txt
+        
+    - name: Comment PR with Results
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      env:
+        FMT_OUTCOME: "${{ steps.fmt.outcome }}"
+        INIT_OUTCOME: "${{ steps.init.outcome }}"
+        VALIDATE_OUTCOME: "${{ steps.validate.outcome }}"
+        TFLINT_OUTCOME: "${{ steps.tflint.outcome }}"
+        CHECKOV_OUTCOME: "${{ steps.checkov.outcome }}"
+        PLAN_OUTCOME: "${{ steps.plan.outcome }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          let planOutput = '';
+          
+          if ('${{ steps.plan.outcome }}' === 'success') {
+            try {
+              planOutput = fs.readFileSync('plan.txt', 'utf8');
+              // Truncate very long plans
+              if (planOutput.length > 60000) {
+                planOutput = planOutput.substring(0, 60000) + '\n\n... (truncated)';
+              }
+            } catch (err) {
+              planOutput = 'Error reading plan output';
+            }
+          }
+          
+          const output = `## Terraform CI Results 🚀
+          
+          | Check | Status | Details |
+          |-------|--------|---------|
+          | Format | ${{ env.FMT_OUTCOME === 'success' && '✅ Passed' || '❌ Failed' }} | Terraform fmt check |
+          | Init | ${{ env.INIT_OUTCOME === 'success' && '✅ Passed' || '❌ Failed' }} | Terraform initialization |
+          | Validation | ${{ env.VALIDATE_OUTCOME === 'success' && '✅ Passed' || '❌ Failed' }} | Terraform validation |
+          | TFLint | ${{ env.TFLINT_OUTCOME === 'success' && '✅ Passed' || '⚠️ Warnings' }} | Terraform linter |
+          | Security | ${{ env.CHECKOV_OUTCOME === 'success' && '✅ Passed' || '⚠️ Issues Found' }} | Checkov security scan |
+          | Plan | ${{ env.PLAN_OUTCOME === 'success' && '✅ Success' || '❌ Failed' }} | Terraform plan |
+          
+          ### Configuration Details
+          - **AWS Region**: us-east-1
+          - **Resources**: VPC, Subnet, IGW, Security Group, EC2 Instance
+          - **Instance Type**: t2.micro
+          
+          <details><summary>📋 Terraform Plan Output</summary>
+          
+          \`\`\`terraform
+          ${planOutput || 'Plan failed or no changes detected'}
+          \`\`\`
+          
+          </details>
+          
+          ---
+          *Workflow: \`${{ github.workflow }}\` | Commit: \`${{ github.sha.substring(0, 7) }}\`*`;
+          
+          // Find existing comment
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          
+          const botComment = comments.find(comment => 
+            comment.user.type === 'Bot' && 
+            comment.body.includes('Terraform CI Results')
+          );
+          
+          // Update or create comment
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: output
+            });
+          } else {
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+          }
+
+    - name: Check for Failures
+      if: |
+        steps.fmt.outcome == 'failure' || 
+        steps.validate.outcome == 'failure' || 
+        steps.plan.outcome == 'failure'
+      run: |
+        echo "❌ One or more Terraform checks failed!"
+        echo ""
+        echo "Failed checks:"
+        [[ "${{ steps.fmt.outcome }}" == "failure" ]] && echo "  - Terraform Format"
+        [[ "${{ steps.validate.outcome }}" == "failure" ]] && echo "  - Terraform Validate"
+        [[ "${{ steps.plan.outcome }}" == "failure" ]] && echo "  - Terraform Plan"
+        exit 1
