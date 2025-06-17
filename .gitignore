@@ -13,6 +13,10 @@ override.tf.json
 terraform.rc
 *.tfplan
 tfplan
+.tflint.hcl.*
+.terraform-docs.yml.backup*
+terraform.tfvars.example
+terraform.tfvars.example.*
 
 # SSH Keys
 *.pem
